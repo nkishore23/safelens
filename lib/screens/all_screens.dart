@@ -4,11 +4,12 @@
 import 'package:flutter/material.dart';
 import 'dart:async';
 import 'dart:math';
+import 'package:camera/camera.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:network_info_plus/network_info_plus.dart';
 import '../models/detected_device.dart';
 import '../models/camera_detection.dart';
 import '../widgets/radar_painter.dart';
-
-import 'detection_list_screen.dart';
 
 class WiFiScanScreen extends StatefulWidget {
   const WiFiScanScreen({super.key});
@@ -24,6 +25,8 @@ class _WiFiScanScreenState extends State<WiFiScanScreen>
   late AnimationController _animationController;
   Timer? _scanTimer;
 
+  String? _currentSsid; // <-- added
+
   @override
   void initState() {
     super.initState();
@@ -31,6 +34,28 @@ class _WiFiScanScreenState extends State<WiFiScanScreen>
       vsync: this,
       duration: const Duration(seconds: 2),
     );
+    _updateCurrentSsid(); // <-- fetch SSID on init
+  }
+
+  Future<void> _updateCurrentSsid() async {
+    // Request location permission required for WiFi SSID on Android
+    final status = await Permission.locationWhenInUse.request();
+    if (!status.isGranted) {
+      if (mounted) {
+        setState(() => _currentSsid = 'Permission required');
+      }
+      return;
+    }
+    try {
+      final info = NetworkInfo();
+      final ssid = await info.getWifiName(); // may return null or "<unknown ssid>"
+      if (!mounted) return;
+      setState(() {
+        _currentSsid = ssid ?? 'Not connected';
+      });
+    } catch (_) {
+      if (mounted) setState(() => _currentSsid = 'Unavailable');
+    }
   }
 
   @override
@@ -49,42 +74,11 @@ class _WiFiScanScreenState extends State<WiFiScanScreen>
     _animationController.repeat();
 
     int tick = 0;
+    // deterministic additions: add a device every 2 ticks to avoid never-showing result
     _scanTimer = Timer.periodic(const Duration(milliseconds: 800), (timer) {
       tick++;
-      if (tick >= 6) {
-        timer.cancel();
-        _animationController.stop();
-        setState(() {
-          _isScanning = false;
-        });
-
-        if (_detectedDevices.isNotEmpty) {
-          Future.delayed(const Duration(milliseconds: 300), () {
-            if (mounted) {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => DetectionListScreen(
-                    devices: _detectedDevices,
-                  ),
-                ),
-              ).then((value) {
-                Navigator.pop(context, _detectedDevices.length);
-              });
-            }
-          });
-        } else {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('No suspicious devices found'),
-              backgroundColor: Colors.green,
-            ),
-          );
-        }
-        return;
-      }
-
-      if (Random().nextBool() && mounted) {
+      // add device at ticks 2,4,6
+      if (tick % 2 == 0 && mounted) {
         setState(() {
           _detectedDevices.add(
             DetectedDevice(
@@ -95,6 +89,35 @@ class _WiFiScanScreenState extends State<WiFiScanScreen>
             ),
           );
         });
+      }
+
+      if (tick >= 6) {
+        timer.cancel();
+        _animationController.stop();
+        if (!mounted) return;
+        setState(() {
+          _isScanning = false;
+        });
+
+        if (_detectedDevices.isNotEmpty) {
+          // open detection list and when user returns forward the count
+          Navigator.push<int?>(
+            context,
+            MaterialPageRoute(
+              builder: (context) => DetectionListScreen(devices: _detectedDevices),
+            ),
+          ).then((returnedCount) {
+            // return count to caller of WiFiScanScreen (HomeScreen)
+            if (mounted) Navigator.pop(context, returnedCount ?? _detectedDevices.length);
+          });
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('No suspicious devices found'),
+              backgroundColor: Colors.green,
+            ),
+          );
+        }
       }
     });
   }
@@ -127,7 +150,34 @@ class _WiFiScanScreenState extends State<WiFiScanScreen>
                   const SizedBox(width: 48),
                 ],
               ),
-              const SizedBox(height: 40),
+              const SizedBox(height: 12),
+
+              // Show real connected SSID
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF252941),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.wifi, color: Color(0xFF6366f1)),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        'Connected: ${_currentSsid ?? "Checking..."}',
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                    ),
+                    IconButton(
+                      onPressed: _updateCurrentSsid,
+                      icon: const Icon(Icons.refresh, color: Colors.white54),
+                    ),
+                  ],
+                ),
+              ),
+
+              const SizedBox(height: 28),
               Expanded(
                 child: Center(
                   child: AnimatedBuilder(
@@ -424,6 +474,9 @@ class _BluetoothScanScreenState extends State<BluetoothScanScreen>
 // ============================================
 // lib/screens/camera_finder_screen.dart
 // ============================================
+
+
+// === Replace existing CameraFinderScreen with this implementation ===
 class CameraFinderScreen extends StatefulWidget {
   const CameraFinderScreen({super.key});
 
@@ -432,240 +485,279 @@ class CameraFinderScreen extends StatefulWidget {
 }
 
 class _CameraFinderScreenState extends State<CameraFinderScreen> {
+  CameraController? _cameraController;
+  bool _cameraReady = false;
   bool _isScanning = false;
-  List<CameraDetection> _detections = [];
+  bool _streaming = false;
+  final List<CameraDetection> _detections = [];
   Timer? _scanTimer;
+  int _frameSkip = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _initCamera();
+  }
 
   @override
   void dispose() {
+    _stopImageStream();
     _scanTimer?.cancel();
+    _cameraController?.dispose();
     super.dispose();
   }
 
+  Future<void> _initCamera() async {
+    final status = await Permission.camera.request();
+    if (!status.isGranted) {
+      if (mounted) {
+        showDialog(
+          context: context,
+          builder: (_) => AlertDialog(
+            title: const Text('Permission required'),
+            content: const Text('Camera permission is required for AI camera finder.'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK')),
+            ],
+          ),
+        );
+      }
+      return;
+    }
+
+    try {
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) return;
+      final back = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.first,
+      );
+      _cameraController = CameraController(back, ResolutionPreset.medium, enableAudio: false);
+      await _cameraController!.initialize();
+      if (mounted) setState(() => _cameraReady = true);
+    } on CameraException catch (e) {
+      // ignore: avoid_print
+      print('Camera error: $e');
+    }
+  }
+
   void _startAIScan() {
+    if (!_cameraReady || _cameraController == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Camera not ready')));
+      return;
+    }
+
+    // clear previous
     setState(() {
       _isScanning = true;
       _detections.clear();
+      _frameSkip = 0;
     });
 
-    _scanTimer = Timer(const Duration(seconds: 3), () {
-      if (mounted) {
-        setState(() {
-          _isScanning = false;
-          _detections = [
-            CameraDetection(
-              location: 'Top right corner',
-              confidence: 92,
-              type: 'Pinhole Camera',
-              timestamp: DateTime.now(),
-            ),
-            CameraDetection(
-              location: 'Smoke detector',
-              confidence: 78,
-              type: 'Hidden Camera',
-              timestamp: DateTime.now(),
-            ),
-          ];
-        });
+    // Start analyzing frames
+    _startImageStream();
+
+    // Timeout after 8 seconds if nothing found
+    _scanTimer?.cancel();
+    _scanTimer = Timer(const Duration(seconds: 8), () {
+      if (!mounted) return;
+      _stopImageStream();
+      setState(() {
+        _isScanning = false;
+      });
+      if (_detections.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No suspicious cameras detected'), backgroundColor: Colors.green),
+        );
       }
     });
   }
 
+  void _startImageStream() {
+    if (_cameraController == null || _streaming) return;
+    _streaming = true;
+    _cameraController!.startImageStream(_processCameraImage);
+  }
+
+  void _stopImageStream() {
+    if (_cameraController == null || !_streaming) return;
+    try {
+      _cameraController!.stopImageStream();
+    } catch (_) {}
+    _streaming = false;
+  }
+
+  // Very lightweight luminance-based detector on Y plane:
+  void _processCameraImage(CameraImage image) {
+    // throttle processing: analyze one in N frames to reduce CPU
+    _frameSkip++;
+    if (_frameSkip % 6 != 0) return;
+
+    try {
+      // Use Y (luminance) plane from YUV image (common on Android/iOS)
+      final plane = image.planes.first;
+      final bytes = plane.bytes;
+      final width = image.width;
+      final height = image.height;
+      if (bytes.isEmpty || width == 0 || height == 0) return;
+
+      // Define a top-right region (quarter of frame)
+      final regionXStart = (width * 3 / 4).floor();
+      final regionYStart = 0;
+      final regionW = (width - regionXStart).clamp(1, width);
+      final regionH = (height / 4).floor().clamp(1, height);
+
+      // sample pixels with stride to keep analysis cheap
+      int sum = 0;
+      int count = 0;
+      final rowStride = plane.bytesPerRow;
+      final pixelStride = plane.bytesPerPixel ?? 1;
+
+      for (int y = regionYStart; y < regionYStart + regionH; y += 4) {
+        final rowOffset = y * rowStride;
+        for (int x = regionXStart; x < regionXStart + regionW; x += 4) {
+          final idx = rowOffset + x * pixelStride;
+          if (idx >= 0 && idx < bytes.length) {
+            sum += bytes[idx];
+            count++;
+          }
+        }
+      }
+
+      if (count == 0) return;
+      final avg = sum / count; // 0..255 approx
+
+      // To estimate background, sample center area quickly
+      int bsum = 0;
+      int bcount = 0;
+      final cx = (width / 2).floor();
+      final cy = (height / 2).floor();
+      final bW = (width / 6).floor().clamp(1, width);
+      final bH = (height / 6).floor().clamp(1, height);
+      for (int y = cy - bH; y < cy + bH; y += 8) {
+        final rowOffset = y * rowStride;
+        for (int x = cx - bW; x < cx + bW; x += 8) {
+          final idx = rowOffset + x * pixelStride;
+          if (idx >= 0 && idx < bytes.length) {
+            bsum += bytes[idx];
+            bcount++;
+          }
+        }
+      }
+      final bavg = bcount == 0 ? avg : (bsum / bcount);
+
+      // If top-right region is significantly brighter than center -> possible specular (lens)
+      final diff = avg - bavg;
+      // thresholds tuned experimentally; adjust as needed
+      if (diff > 18 && avg > 90) {
+        final confidence = ((diff.clamp(0, 80) / 80) * 100).round().clamp(40, 99);
+        // Add detection if not already detected at same location
+        if (mounted && !_detections.any((d) => d.location == 'Top right corner')) {
+          setState(() {
+            _detections.add(CameraDetection(
+              location: 'Top right corner',
+              confidence: confidence,
+              type: 'Pinhole Camera',
+              timestamp: DateTime.now(),
+            ));
+          });
+          // stop stream & timer after detection (you can keep analyzing if you prefer)
+          _stopImageStream();
+          _scanTimer?.cancel();
+          setState(() {
+            _isScanning = false;
+          });
+        }
+      }
+    } catch (e) {
+      // ignore analysis errors
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final preview = _cameraReady && _cameraController != null
+        ? AspectRatio(aspectRatio: _cameraController!.value.aspectRatio, child: CameraPreview(_cameraController!))
+        : const Center(child: Icon(Icons.camera_alt, size: 80, color: Colors.white30));
+
     return Scaffold(
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(20.0),
-          child: Column(
-            children: [
-              Row(
+          child: Column(children: [
+            Row(
+              children: [
+                IconButton(onPressed: () => Navigator.pop(context), icon: const Icon(Icons.arrow_back, color: Colors.white)),
+                const Expanded(child: Text('AI Camera Finder', textAlign: TextAlign.center, style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white))),
+                const SizedBox(width: 48),
+              ],
+            ),
+            const SizedBox(height: 20),
+            Container(
+              height: 300,
+              decoration: BoxDecoration(
+                color: const Color(0xFF252941),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: _isScanning ? const Color(0xFF6366f1) : Colors.transparent, width: 3),
+              ),
+              clipBehavior: Clip.hardEdge,
+              child: Stack(
                 children: [
-                  IconButton(
-                    onPressed: () => Navigator.pop(context),
-                    icon: const Icon(Icons.arrow_back, color: Colors.white),
-                  ),
-                  const Expanded(
-                    child: Text(
-                      'AI Camera Finder',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 48),
-                ],
-              ),
-              const SizedBox(height: 20),
-              Container(
-                height: 300,
-                decoration: BoxDecoration(
-                  color: const Color(0xFF252941),
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(
-                    color: _isScanning
-                        ? const Color(0xFF6366f1)
-                        : Colors.transparent,
-                    width: 3,
-                  ),
-                ),
-                child: Center(
-                  child: _isScanning
-                      ? Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: const [
-                            CircularProgressIndicator(
-                              color: Color(0xFF6366f1),
-                            ),
-                            SizedBox(height: 16),
-                            Text(
-                              'AI Scanning...',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 16,
-                              ),
-                            ),
-                          ],
-                        )
-                      : Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: const [
-                            Icon(
-                              Icons.camera_alt,
-                              size: 80,
-                              color: Colors.white30,
-                            ),
-                            SizedBox(height: 16),
-                            Text(
-                              'Camera Preview',
-                              style: TextStyle(
-                                color: Colors.white54,
-                                fontSize: 16,
-                              ),
-                            ),
-                          ],
-                        ),
-                ),
-              ),
-              const SizedBox(height: 20),
-              if (_detections.isNotEmpty) ...[
-                Expanded(
-                  child: ListView.builder(
-                    itemCount: _detections.length,
-                    itemBuilder: (context, index) {
-                      final detection = _detections[index];
-                      return Container(
-                        margin: const EdgeInsets.only(bottom: 12),
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF252941),
-                          borderRadius: BorderRadius.circular(16),
-                          border: Border.all(
-                            color: detection.confidence > 85
-                                ? Colors.red
-                                : Colors.orange,
-                            width: 2,
+                  Positioned.fill(child: preview),
+                  if (_isScanning)
+                    Positioned.fill(
+                      child: Container(
+                        color: Colors.black26,
+                        child: const Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              CircularProgressIndicator(color: Color(0xFF6366f1)),
+                              SizedBox(height: 12),
+                              Text('AI Scanning...', style: TextStyle(color: Colors.white)),
+                            ],
                           ),
                         ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                Text(
-                                  detection.type,
-                                  style: const TextStyle(
-                                    fontSize: 16,
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.white,
-                                  ),
-                                ),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 12,
-                                    vertical: 6,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: detection.confidence > 85
-                                        ? Colors.red
-                                        : Colors.orange,
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                  child: Text(
-                                    '${detection.confidence}%',
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontWeight: FontWeight.bold,
-                                      fontSize: 12,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 8),
-                            Text(
-                              'Location: ${detection.location}',
-                              style: const TextStyle(
-                                color: Colors.white70,
-                                fontSize: 14,
-                              ),
-                            ),
-                          ],
-                        ),
-                      );
-                    },
-                  ),
-                ),
-              ] else if (!_isScanning)
-                Expanded(
-                  child: Center(
-                    child: Container(
-                      padding: const EdgeInsets.all(20),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF252941),
-                        borderRadius: BorderRadius.circular(16),
-                      ),
-                      child: const Text(
-                        'Point camera at suspicious areas\nAI will detect hidden cameras',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          color: Colors.white54,
-                          fontSize: 14,
-                        ),
                       ),
                     ),
-                  ),
-                ),
-              const SizedBox(height: 20),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: _isScanning ? null : _startAIScan,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF6366f1),
-                    disabledBackgroundColor:
-                        const Color(0xFF6366f1).withOpacity(0.5),
-                    padding: const EdgeInsets.symmetric(vertical: 16),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16),
-                    ),
-                  ),
-                  child: Text(
-                    _isScanning ? 'Scanning...' : 'Start AI Scan',
-                    style: const TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
-                    ),
-                  ),
-                ),
+                ],
               ),
-            ],
-          ),
+            ),
+            const SizedBox(height: 16),
+            if (_detections.isNotEmpty)
+              Expanded(
+                child: ListView.builder(
+                  itemCount: _detections.length,
+                  itemBuilder: (context, i) {
+                    final d = _detections[i];
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(color: const Color(0xFF252941), borderRadius: BorderRadius.circular(16), border: Border.all(color: d.confidence > 85 ? Colors.red : Colors.orange, width: 2)),
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                          Text(d.type, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                          Container(padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6), decoration: BoxDecoration(color: d.confidence > 85 ? Colors.red : Colors.orange, borderRadius: BorderRadius.circular(12)), child: Text('${d.confidence}%', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))),
+                        ]),
+                        const SizedBox(height: 8),
+                        Text('Location: ${d.location}', style: const TextStyle(color: Colors.white70)),
+                      ]),
+                    );
+                  },
+                ),
+              )
+            else if (!_isScanning)
+              const Expanded(child: Center(child: Text('Point camera at suspicious areas\nAI will detect hidden cameras', textAlign: TextAlign.center, style: TextStyle(color: Colors.white54)))),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: _isScanning ? null : _startAIScan,
+                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF6366f1), padding: const EdgeInsets.symmetric(vertical: 16), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16))),
+                child: Text(_isScanning ? 'Scanning...' : 'Start AI Scan', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+              ),
+            ),
+          ]),
         ),
       ),
     );
@@ -1790,8 +1882,134 @@ class FAQScreen extends StatelessWidget {
 // ============================================
 // Detection List Screen
 // ============================================
+class DetectionListScreen extends StatelessWidget {
+  final List<DetectedDevice> devices;
 
+  const DetectionListScreen({super.key, required this.devices});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(20.0),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  IconButton(
+                    onPressed: () => Navigator.pop(context, devices.length), // return count
+                    icon: const Icon(Icons.arrow_back, color: Colors.white),
+                  ),
+                  const Expanded(
+                    child: Text(
+                      'Detection Results',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                    ),
+                  ),
+                  const SizedBox(width: 48),
+                ],
+              ),
+              const SizedBox(height: 20),
+              Expanded(
+                child: ListView.builder(
+                  itemCount: devices.length,
+                  itemBuilder: (context, index) {
+                    final d = devices[index];
+                    return GestureDetector(
+                      onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => DeviceInfoScreen(device: d))),
+                      child: Container(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(color: const Color(0xFF252941), borderRadius: BorderRadius.circular(12)),
+                        child: Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(10),
+                              decoration: BoxDecoration(
+                                color: (d.riskLevel == 2 ? Colors.red : (d.riskLevel == 1 ? Colors.orange : Colors.green)).withOpacity(0.2),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Icon(Icons.videocam, color: d.riskLevel == 2 ? Colors.red : (d.riskLevel == 1 ? Colors.orange : Colors.green)),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(d.name, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                                  const SizedBox(height: 4),
+                                  Text(d.ipAddress, style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                                ],
+                              ),
+                            ),
+                            const Icon(Icons.arrow_forward_ios, color: Colors.white54, size: 16),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 // ============================================
 // Device Info Screen
 // ============================================
+class DeviceInfoScreen extends StatelessWidget {
+  final DetectedDevice device;
+  const DeviceInfoScreen({super.key, required this.device});
+
+  Widget _row(String a, String b) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8.0),
+        child: Row(children: [Expanded(child: Text(a, style: const TextStyle(color: Colors.white70))), Text(b, style: const TextStyle(color: Colors.white))]),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(20.0),
+          child: Column(children: [
+            Row(
+              children: [
+                IconButton(onPressed: () => Navigator.pop(context), icon: const Icon(Icons.arrow_back, color: Colors.white)),
+                const Expanded(child: Text('Device info', textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold))),
+                const SizedBox(width: 48),
+              ],
+            ),
+            const SizedBox(height: 24),
+            Container(
+              width: 160,
+              height: 160,
+              decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: const Color(0xFF6366f1), width: 3)),
+              child: Center(child: Icon(Icons.videocam, color: const Color(0xFF6366f1), size: 48)),
+            ),
+            const SizedBox(height: 16),
+            Text(device.name, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            _row('IP / MAC', device.ipAddress),
+            _row('Risk level', device.riskLevel == 2 ? 'High' : (device.riskLevel == 1 ? 'Medium' : 'Low')),
+            const Spacer(),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: () => Navigator.popUntil(context, (route) => route.isFirst),
+                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF6366f1), padding: const EdgeInsets.symmetric(vertical: 16), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
+                child: const Text('I found it!', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+              ),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+}
